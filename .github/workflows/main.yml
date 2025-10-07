@@ -1,42 +1,81 @@
-# Nombre de la action
-name: Build container and run VISE API testing
-# Bajo que acción se va a ejecutar la action (en este caso manual)
+name: Azure Continuous Delivery
+
 on:
   workflow_dispatch:
-# A la hora de ejecutar la acción pedir los siguientes atributos
     inputs:
+      IMAGE_REPOSITORY:
+        description: 'Repository of the image (same as declared in AppService creation)'
+        required: true
+        default: 'api-vise'
+      IMAGE_TAG:
+        description: 'Tag of the image'
+        required: true
+        default: 'latest'
+      AZURE_WEBAPP_NAME:
+        description: 'Nombre del App Service creado en Azure'
+        required: true
       PORT:
-        description: 'The port of your application'
+        description: 'Port of the application'
         required: true
-        default: "3000"
-      ACCEPTEDCODE:
-        description: 'The http success code of the code'
-        required: true
-        default: "201"
-# Tareas a ejecutar
+        default: '443'
+
+env:
+  IMAGE_URL: ${{ secrets.ACR_NAME }}.azurecr.io/${{ github.event.inputs.IMAGE_REPOSITORY }}:${{ github.event.inputs.IMAGE_TAG }}
+
 jobs:
-  test:
-# SO de la maquina virtual
+  build-and-push-image:
+    name: 'Build and Push to ACR'
     runs-on: ubuntu-latest
-# Pasos a seguir
     steps:
-# Descargar el código del repositorio
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-# Instalar docker
-      - name: Setup docker
-        uses: docker/setup-buildx-action@v3
-# Construir imagen de docker
-      - name: Build docker image
-        run: |
-          docker build -t vise-api:latest .
-# Levantar contenedor
-      - name: Run container
-        run: |
-          docker run -d -p ${{ github.event.inputs.PORT }}:${{ github.event.inputs.PORT }} --name vise-api vise-api:latest 
-          sleep 5
-# Instalar hurl
+
+      - name: Docker Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_NAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push to ACR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_URL }}
+
+  deploy:
+    name: 'Deploy remote container to Azure'
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    steps:
+      - name: Deploy to Azure Web App for Container
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ github.event.inputs.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_OSCAR_CARDOZO }}
+          images: ${{ env.IMAGE_URL }}
+
+  test-deploy:
+    name: 'Test deployed service'
+    runs-on: ubuntu-latest
+    needs: [build-and-push-image, deploy]
+    steps:
+      - name: Checkout session.hurl
+        uses: actions/checkout@v3
+        with:
+          sparse-checkout: |
+            session.hurl
+          sparse-checkout-cone-mode: false
+
       - name: Setup hurl (API testing tool)
         uses: gacts/install-hurl@v1
+
       - name: Test API
-        run: hurl --variable expected_accept_code=${{ github.event.inputs.ACCEPTEDCODE }} --variable host=http://localhost:${{ github.event.inputs.PORT }} --error-format long --test session.hurl
+        run: |
+          hurl --variable host=https://${{ github.event.inputs.AZURE_WEBAPP_NAME }}.azurewebsites.net:${{ github.event.inputs.PORT }} \
+               --connect-timeout 20s \
+               --error-format long \
+               --verbose \
+               --test session.hurl
